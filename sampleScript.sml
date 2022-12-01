@@ -37,19 +37,22 @@ QED
 (* sketch of some automation *)
 
 val term_patterns =
-  [(“_m + _n:num”,"mk_add"),
-   (“_m - _n:num”,"mk_sub"),
-   (“_m < _n:num”,"mk_lt"),
-   (“_m ≤ _n:num”,"mk_le"),
+  [(“arithmetic$+”,"nat_add"),
+   (“arithmetic$-”,"nat_sub"),
+   (“prim_rec$<”,"nat_lt"),
+   (“arithmetic$<=”,"nat_le"),
+   (“num$SUC”,"nat_suc"),
    (“_m = _n:'a”,"mk_eq"),
    (“_m ⇒ _n:bool”,"mk_imp"),
-   (“SUC _m”,"mk_suc"),
    (“if _a then _b else _c”,"mk_if")];
 
+datatype output_type = FunApp of string | Tuple | List;
 datatype output = String of string
-                | App of bool * string * output list;
+                | App of bool * output_type * output list;
 
-fun app x y = App (false,x,y);
+fun app x y = App (false,FunApp x,y);
+fun list xs = App (false,List,xs);
+fun tuple xs = App (false,Tuple,xs);
 fun quote s = String ("\"" ^ s ^ "\"")
 
 fun export_ty ty =
@@ -63,6 +66,12 @@ fun export_ty ty =
   let
     val (n,tys) = dest_type ty
   in app "mk_type" (quote n :: map export_ty tys)  end
+
+fun mk_app f x =
+  case f of
+    App (false,FunApp "mk_app",[g,App (false,List,xs)]) =>
+      app "mk_app" [g,list (xs @ [x])]
+  | _ => app "mk_app" [f,list [x]];
 
 fun export tm =
   let
@@ -87,46 +96,85 @@ fun export tm =
   in app s (map export args) end handle HOL_ERR _ =>
   let
     val (f,x) = dest_comb tm
-  in app "mk_app" [export f, export x] end handle HOL_ERR _ =>
+  in mk_app (export f) (export x) end handle HOL_ERR _ =>
   let
     val (n,ty) = dest_const tm
-  in app "mk_const" [quote n] end;
+  in app "mk_id" [quote n] end;
 
 fun print_output out =
   let
     val threshold = 80
+    fun size_aux (FunApp s) = size s + 3 | size_aux _ = 2;
     fun annotate (String s) = (String s, size s)
       | annotate (App (_,s,xs)) =
           let val ys = map annotate xs
-              val n = foldr (fn ((_,m),n) => n+m) 0 ys + size s + 3
+              val n = foldr (fn ((_,m),n) => n+m) 0 ys + size_aux s
               val zs = map fst ys
           in (App (n < threshold, s, zs), n) end
+    fun needs_parens (App (b,FunApp s,xs)) = not (null xs)
+      | needs_parens _ = false
+    fun print_nil (FunApp s) = print s
+      | print_nil Tuple = print "()"
+      | print_nil List = print "[]"
+    fun print_open (FunApp s) = print (s ^ " ")
+      | print_open Tuple = print "("
+      | print_open List = print "["
+    fun print_close (FunApp s) = ()
+      | print_close Tuple = print ")"
+      | print_close List = print "]"
+    fun get_sep (FunApp s) = " "
+      | get_sep _ = ","
     fun print_o indent (String s) = print s
       | print_o indent (App (b,s,xs)) =
+          if null xs then print_nil s else
           if b then
-            (print s; print "("; print_o_list "" xs; print ")")
+            (print_open s; print_o_list (get_sep s) "" xs; print_close s)
           else
-            let val new_indent = indent ^ "  "
-            in print s;
-               print "(";
-               print new_indent;
-               print_o_list new_indent xs;
-               print ")"
+            let val new_indent = indent ^ (if needs_parens (App (b,s,xs))
+                                           then "  " else " ")
+            in print_open s;
+               (if needs_parens (App (b,s,xs)) then print new_indent else print "");
+               print_o_list (get_sep s) new_indent xs;
+               print_close s
             end
-    and print_o_list indent [] = ()
-      | print_o_list indent [x] = print_o indent x
-      | print_o_list indent (x::xs) =
-          (print_o indent x; print (", " ^ indent); print_o_list indent xs)
+    and print_o_list sep indent [] = ()
+      | print_o_list sep indent [x] =
+          if needs_parens x andalso sep = " " then
+            (print "("; print_o indent x; print ")")
+          else print_o indent x
+      | print_o_list sep indent (x::y::xs) =
+          (print_o_list sep indent [x];
+           print (sep ^ indent);
+           print_o_list sep indent (y::xs))
   val _ = print "\n\n"
   val _ = print_o "\n" (fst (annotate out))
   val _ = print ";;\n\n"
   in () end;
 
-val def = fib_def
-val tm = def |> SPEC_ALL |> concl
-val c = tm |> dest_eq |> fst |> repeat rator
-val (cname,cty) = dest_const c
-val out = app "define" [quote cname, export_ty cty, export tm]
-val _ = print_output out
+fun export_def def =
+  let
+    val tm = def |> SPEC_ALL |> concl
+    val (l,r) = tm |> dest_eq
+    val c = l |> repeat rator
+    fun dest_args tm =
+      let val (f,x) = dest_comb tm in dest_args f @ [x] end handle HOL_ERR _ => [];
+    val vs = l |> dest_args
+    val (cname,cty) = dest_const c
+    fun dest_arg v = let
+      val (n,ty) = dest_var v
+      in tuple [quote n, export_ty ty] end
+    val args = list (map dest_arg vs)
+    val ret_ty = export_ty (type_of l)
+    val rhs_e = export r
+  in
+    app "mk_define"
+      [quote cname,
+       quote (cname ^ "_def"),
+       args,
+       export_ty (type_of (tm |> dest_eq |> fst)),
+       rhs_e]
+  end;
+
+val _ = print_output $ export_def fib_def;
 
 val _ = export_theory();
